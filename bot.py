@@ -37,7 +37,7 @@ async def on_ready():
 # --- PDF Naming Engine ---
 def analyze_pdf_with_llm(file_bytes, original_filename):
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
 
         prompt = (
             "You are an academic document classification assistant for a university computer science department.\n"
@@ -73,7 +73,7 @@ async def on_message(message):
     if match:
         question = match.group(1).strip()
         try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            model = genai.GenerativeModel("gemini-2.0-flash")
             response = model.generate_content(question)
             await message.reply(response.text)
         except Exception as e:
