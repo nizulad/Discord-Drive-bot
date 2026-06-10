@@ -2,4 +2,4 @@ discord.py
 requests
 Flask
 google-generativeai
-
+pypdf
