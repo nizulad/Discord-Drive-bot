@@ -8,6 +8,8 @@ from threading import Thread
 import discord
 from discord.ext import commands
 import google.generativeai as genai
+from pypdf import PdfReader
+import io
 
 # --- Configuration ---
 DISCORD_TOKEN = os.getenv("DT")
@@ -33,35 +35,78 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 @bot.event
 async def on_ready():
     print(f"Bot successfully connected as {bot.user.name}")
+#extracts pdf text
+def extract_pdf_text(file_bytes, max_pages=3):
+    reader = PdfReader(io.BytesIO(file_bytes))
+
+    total_pages = len(reader.pages)
+
+    text_parts = []
+
+    # First pages
+    for i in range(min(max_pages, total_pages)):
+        page_text = reader.pages[i].extract_text()
+        if page_text:
+            text_parts.append(page_text)
+
+    # Last pages
+    for i in range(max(total_pages - max_pages, 0), total_pages):
+        page_text = reader.pages[i].extract_text()
+        if page_text:
+            text_parts.append(page_text)
+
+    return "\n".join(text_parts)
+
+
+
+
+
 
 # --- PDF Naming Engine ---
 def analyze_pdf_with_llm(file_bytes, original_filename):
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        text = extract_pdf_text(file_bytes, max_pages=3)
 
-        prompt = (
-            "You are an academic document classification assistant for a university computer science department.\n"
-            "Analyze the provided document pages and output a clean filename based on these strict formatting rules:\n\n"
-            "1. Identify the Professor's name (e.g., Amrouche, Nacer, Belkacem). If completely unknown, use 'Unknown'.\n"
-            "2. Determine if the document is an EVALUATION (Exam, Rattrapage, Interro, Controle, Test) or INSTRUCTIONAL (Cours, TD, TP, Serie, Fiche).\n"
-            "3. IF EVALUATION: Output format MUST be exactly: Prof Name | Year Type.pdf\n"
-            "4. IF INSTRUCTIONAL: Output format MUST be exactly: Prof Name | Chapter or Material Title.pdf\n\n"
-            "Rules:\n"
-            "- Do not include introductory text, markdown code blocks, quotes, or explanations.\n"
-            "- Output ONLY the final, raw filename string ending in '.pdf'.\n"
-            "- Treat French and English academic terms as matching equivalents."
-        )
+        prompt = f"""
+You are an academic document classifier.
 
-        pdf_part = {"mime_type": "application/pdf", "data": file_bytes}
-        response = model.generate_content([prompt, pdf_part])
-        cleaned_name = response.text.strip().replace("`", "").replace('"', '').replace("'", "")
+You will receive extracted text from a PDF (first and last pages).
 
-        return cleaned_name if cleaned_name.endswith(".pdf") else f"{cleaned_name}.pdf"
+Your job:
+- Identify professor name
+- Identify document type:
+  - COURSE (cours, td, tp, lecture, chapter)
+  - EXAM (exam, test, controle, rattrapage)
+
+OUTPUT RULES:
+- If COURSE:
+  Format: Professor Name | Chapter Name.pdf
+- If EXAM:
+  Format: Professor Name | Year.pdf
+
+STRICT RULES:
+- Return ONLY filename
+- No explanations
+- No markdown
+- Always end with .pdf
+
+EXTRACTED PDF TEXT:
+{text}
+"""
+
+        result = ask_groq(prompt)
+
+        cleaned = result.strip().replace("`", "").replace('"', "").replace("'", "")
+
+        if not cleaned.endswith(".pdf"):
+            cleaned += ".pdf"
+
+        return cleaned
 
     except Exception as e:
-        print(f"Gemini PDF Exception — {type(e).__name__}: {e}")
+        print("PDF Groq error:", e)
         return original_filename
-
+        
 # --- Chat Handler (!question!) ---
 @bot.event
 async def on_message(message):
