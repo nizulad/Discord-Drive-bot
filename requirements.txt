@@ -1,12 +1,4 @@
-<<<<<<< HEAD
-discord.py
-requests
-Flask
-google-generativeai
-pypdf
-=======
 discord.py>=2.3.2
 aiohttp>=3.9.0
 Pillow>=10.0.0
 img2pdf>=0.5.1
->>>>>>> af9e5ae (save local files)
