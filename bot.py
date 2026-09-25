@@ -8,25 +8,6 @@ import discord
 from flask import Flask
 from PIL import Image
 
-# --- Dummy Flask App for Render Web Service Health Checks ---
-app = Flask(__name__)
-
-
-@app.route("/")
-def health_check():
-  return "Bot is alive!", 200
-
-
-def run_bot():
-  if not TOKEN:
-    raise SystemExit(
-        "Set the DISCORD_BOT_TOKEN environment variable before running."
-    )
-  client.run(TOKEN)
-
-
-# -------------------------------------------------------------
-
 TRIGGER_PREFIX = "!scrape anoun 1.0!"
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 OWNER_ID = os.environ.get("DISCORD_OWNER_ID", "")
@@ -36,6 +17,13 @@ intents.message_content = True
 intents.messages = True
 
 client = discord.Client(intents=intents)
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def health_check():
+  return "Bot is alive!", 200
 
 
 def fmt_date(dt: datetime) -> str:
@@ -59,7 +47,10 @@ def load_as_rgb(path: str) -> Image.Image:
 
 @client.event
 async def on_ready():
-  print(f"Logged in as {client.user}")
+  print(f"Logged in successfully as {client.user}!")
+  await client.change_presence(
+      activity=discord.Game(name="!scrape anoun 1.0! in DMs")
+  )
 
 
 @client.event
@@ -168,9 +159,23 @@ async def on_message(message: discord.Message):
   await reply_channel.send(file=discord.File(images_txt_path))
 
 
-# Start the discord bot in a background thread when Gunicorn imports this file
-threading.Thread(target=run_bot, daemon=True).start()
+def start_bot_thread():
+  if not TOKEN:
+    print("ERROR: DISCORD_BOT_TOKEN is not set.")
+    return
+
+  def run():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(client.start(TOKEN))
+
+  threading.Thread(target=run, daemon=True).start()
+
+
+# Trigger thread startup when Gunicorn initializes the worker process
+start_bot_thread()
 
 if __name__ == "__main__":
-  run_bot()
+  port = int(os.environ.get("PORT", 10000))
+  app.run(host="0.0.0.0", port=port)
 
