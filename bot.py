@@ -266,8 +266,8 @@ async def run_fetch(ctx, target_channel_id: int, option1: str, option2: str, ren
 
     selected = queue[skip:] if unlimited else queue[skip:skip + count]
 
-    # Upload oldest -> newest so Drive order matches channel order
-    selected.reverse()
+    # Keep newest-first order: the first upload is the most recent file
+    # after the skip, and it works backward in time from there.
 
     mode = "with AI rename" if rename else "no rename"
     limit_desc = "until an error occurs" if unlimited else f"{len(selected)} file(s)"
@@ -344,4 +344,3 @@ async def fetch_renamed(ctx, target_channel_id: int, option1: str = "1", option2
 # ---------------- START ----------------
 Thread(target=run_flask).start()
 bot.run(DISCORD_TOKEN)
-
