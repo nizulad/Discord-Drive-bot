@@ -1,181 +1,266 @@
-import asyncio
-from datetime import datetime
 import os
-import threading
-
-import aiohttp
-import discord
+import re
+import base64
+import asyncio
+import requests
 from flask import Flask
-from PIL import Image
+from threading import Thread
+import discord
+from discord.ext import commands
+from pypdf import PdfReader
+import io
 
-TRIGGER_PREFIX = "!scrape anoun 1.0!"
-TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-OWNER_ID = os.environ.get("DISCORD_OWNER_ID", "")
+# ---------------- CONFIG ----------------
+DISCORD_TOKEN = os.getenv("DT")
+GAS_WEBAPP_URL = os.getenv("GAS_WEBAPP_URL")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+HISTORY_SCAN_LIMIT = 500  # how many messages to look back when doc_count is set
+
+# ---------------- FLASK ----------------
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# ---------------- DISCORD ----------------
 intents = discord.Intents.default()
 intents.message_content = True
-intents.messages = True
+bot = commands.Bot(command_prefix="/", intents=intents)
 
-client = discord.Client(intents=intents)
-
-app = Flask(__name__)
-
-
-@app.route("/")
-def health_check():
-  return "Bot is alive!", 200
-
-
-def fmt_date(dt: datetime) -> str:
-  return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-
-async def download_image(session: aiohttp.ClientSession, url: str, dest: str):
-  async with session.get(url) as resp:
-    resp.raise_for_status()
-    data = await resp.read()
-    with open(dest, "wb") as f:
-      f.write(data)
-
-
-def load_as_rgb(path: str) -> Image.Image:
-  im = Image.open(path)
-  if im.mode != "RGB":
-    im = im.convert("RGB")
-  return im
-
-
-@client.event
+@bot.event
 async def on_ready():
-  print(f"Logged in successfully as {client.user}!")
-  await client.change_presence(
-      activity=discord.Game(name="!scrape anoun 1.0! in DMs")
-  )
+    print(f"Bot successfully connected as {bot.user}")
 
+# ---------------- GROQ FUNCTION ----------------
+def ask_groq(prompt, model="llama-3.3-70b-versatile"):
+    url = "https://api.groq.com/openai/v1/chat/completions"
 
-@client.event
-async def on_message(message: discord.Message):
-  if message.author.bot:
-    return
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-  if not isinstance(message.channel, discord.DMChannel):
-    return
+    data = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ]
+    }
 
-  content = message.content.strip()
-  if not content.startswith(TRIGGER_PREFIX):
-    return
+    r = requests.post(url, headers=headers, json=data, timeout=60)
 
-  reply_channel = message.channel
+    if r.status_code != 200:
+        raise Exception(r.text)
 
-  if OWNER_ID and str(message.author.id) != OWNER_ID:
-    await reply_channel.send("Not authorized to run this command.")
-    return
+    return r.json()["choices"][0]["message"]["content"]
 
-  arg = content[len(TRIGGER_PREFIX) :].strip()
-  if not arg.isdigit():
-    await reply_channel.send(
-        f"Usage: `{TRIGGER_PREFIX} <channel_id>` — send me the ID of the"
-        " channel to scrape."
-    )
-    return
+# extract text from pdf
+def extract_pdf_text(file_bytes, max_pages=3):
+    reader = PdfReader(io.BytesIO(file_bytes))
 
-  target_channel_id = int(arg)
-  channel = client.get_channel(target_channel_id)
-  if channel is None:
+    total_pages = len(reader.pages)
+
+    text_parts = []
+
+    # First pages
+    for i in range(min(max_pages, total_pages)):
+        page_text = reader.pages[i].extract_text()
+        if page_text:
+            text_parts.append(page_text)
+
+    # Last pages
+    for i in range(max(total_pages - max_pages, 0), total_pages):
+        page_text = reader.pages[i].extract_text()
+        if page_text:
+            text_parts.append(page_text)
+
+    return "\n".join(text_parts)
+
+# ---------------- PDF ANALYSIS ----------------
+def analyze_pdf_with_llm(file_bytes, original_filename):
     try:
-      channel = await client.fetch_channel(target_channel_id)
-    except discord.Forbidden:
-      await reply_channel.send("I don't have access to that channel.")
-      return
-    except discord.NotFound:
-      await reply_channel.send("No channel found with that ID.")
-      return
+        text = extract_pdf_text(file_bytes, max_pages=3)
+
+        prompt = f"""
+You are an academic document classifier.
+
+You will receive extracted text from a PDF (first and last pages).
+
+Your job:
+- Identify professor name
+- Identify document type:
+  - COURSE (cours, td, tp, lecture, chapter)
+  - EXAM (exam, test, controle, rattrapage)
+
+OUTPUT RULES:
+- If COURSE:
+  Format: Professor Name | Chapter Name.pdf
+- If EXAM:
+  Format: Professor Name | Year.pdf
+
+STRICT RULES:
+- Return ONLY filename
+- No explanations
+- No markdown
+- Always end with .pdf
+
+EXTRACTED PDF TEXT:
+{text}
+"""
+
+        result = ask_groq(prompt)
+
+        cleaned = result.strip().replace("`", "").replace('"', "").replace("'", "")
+
+        if not cleaned.endswith(".pdf"):
+            cleaned += ".pdf"
+
+        return cleaned
+
     except Exception as e:
-      await reply_channel.send(f"Couldn't fetch that channel: {e}")
-      return
+        print("PDF Groq error:", e)
+        return original_filename
 
-  status = await reply_channel.send(
-      f"Scraping <#{channel.id}>, this may take a while…"
-  )
+# ---------------- HELPERS ----------------
+def get_extension(filename):
+    return os.path.splitext(filename.lower())[1]
 
-  work_dir = f"scrape_{channel.id}_{int(datetime.utcnow().timestamp())}"
-  img_dir = os.path.join(work_dir, "images")
-  os.makedirs(img_dir, exist_ok=True)
+def is_supported(attachment):
+    ext = get_extension(attachment.filename)
+    return ext == ".pdf" or ext in IMAGE_EXTENSIONS
 
-  text_lines = []
-  image_entries = []
-  img_index = 0
+def upload_to_drive(file_name, file_bytes, mime_type):
+    payload = {
+        "fileName": file_name,
+        "fileData": base64.b64encode(file_bytes).decode("utf-8"),
+        "mimeType": mime_type,
+    }
+    response = requests.post(GAS_WEBAPP_URL, json=payload, timeout=60)
+    return response.json()
 
-  async with aiohttp.ClientSession() as session:
-    async for msg in channel.history(limit=None, oldest_first=True):
-      if msg.author.bot:
-        continue
+# ---------------- CHAT FEATURE ----------------
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
 
-      date_str = fmt_date(msg.created_at)
-
-      if msg.content and msg.content.strip():
-        text_lines.append(
-            f"[{date_str}] {msg.author.display_name}: {msg.content.strip()}"
-        )
-
-      for att in msg.attachments:
-        is_image = (att.content_type or "").startswith("image/") or att.filename.lower().endswith(
-            (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
-        )
-        if not is_image:
-          continue
-        img_index += 1
-        ext = os.path.splitext(att.filename)[1] or ".png"
-        local_path = os.path.join(img_dir, f"{img_index:04d}{ext}")
+    match = re.search(r'!(.+?)!', message.content)
+    if match:
+        question = match.group(1).strip()
         try:
-          await download_image(session, att.url, local_path)
-          image_entries.append((img_index, date_str, local_path))
+            reply = ask_groq(question)
+            await message.reply(reply)
         except Exception as e:
-          print(f"Failed to download {att.url}: {e}")
+            await message.reply(f"Error: {str(e)}")
+        return
 
-  messages_path = os.path.join(work_dir, "messages.txt")
-  with open(messages_path, "w", encoding="utf-8") as f:
-    f.write("\n".join(text_lines))
+    await bot.process_commands(message)
 
-  images_txt_path = os.path.join(work_dir, "images.txt")
-  with open(images_txt_path, "w", encoding="utf-8") as f:
-    for idx, date_str, _ in image_entries:
-      f.write(f"{idx}: {date_str}\n")
+# ---------------- CORE FETCH LOGIC ----------------
+async def run_fetch(ctx, target_channel_id: int, doc_count: int, rename: bool):
+    if not isinstance(ctx.channel, discord.DMChannel):
+        await ctx.author.send("Error: Use this command in DM only.")
+        return
 
-  pdf_path = os.path.join(work_dir, "images.pdf")
-  if image_entries:
-    pages = [load_as_rgb(p) for _, _, p in image_entries]
-    pages[0].save(pdf_path, "PDF", save_all=True, append_images=pages[1:])
-    for p in pages:
-      p.close()
-  else:
-    with open(pdf_path, "wb") as f:
-      f.write(b"")
+    if doc_count == 0 or doc_count < -1:
+        await ctx.send("Count must be a positive number, or -1 for everything.")
+        return
 
-  await status.edit(content="Done. Sending files…")
+    target_channel = bot.get_channel(target_channel_id)
+    if not target_channel:
+        try:
+            target_channel = await bot.fetch_channel(target_channel_id)
+        except Exception:
+            await ctx.send("Could not access channel.")
+            return
 
-  await reply_channel.send(file=discord.File(messages_path))
-  await reply_channel.send(file=discord.File(pdf_path))
-  await reply_channel.send(file=discord.File(images_txt_path))
+    fetch_all = doc_count == -1
+    scan_limit = None if fetch_all else HISTORY_SCAN_LIMIT
 
+    await ctx.send(f"Scanning #{target_channel.name}...")
 
-def start_bot_thread():
-  if not TOKEN:
-    print("ERROR: DISCORD_BOT_TOKEN is not set.")
-    return
+    # History is newest -> oldest, so we collect the most recent files first
+    queue = []
+    async for message in target_channel.history(limit=scan_limit):
+        for attachment in message.attachments:
+            if is_supported(attachment):
+                queue.append(attachment)
+                if not fetch_all and len(queue) >= doc_count:
+                    break
+        if not fetch_all and len(queue) >= doc_count:
+            break  # stop scanning entirely, not just the inner loop
 
-  def run():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(client.start(TOKEN))
+    # Upload oldest -> newest so Drive order matches channel order
+    queue.reverse()
 
-  threading.Thread(target=run, daemon=True).start()
+    mode = "with AI rename" if rename else "no rename"
+    await ctx.send(f"Found {len(queue)} file(s) ({mode}). Processing...")
 
+    loop = asyncio.get_running_loop()
+    success = 0
 
-# Trigger thread startup when Gunicorn initializes the worker process
-start_bot_thread()
+    for attachment in queue:
+        try:
+            file_bytes = await attachment.read()
+            original_name = attachment.filename
+            ext = get_extension(original_name)
+            mime_type = MIME_TYPES.get(ext, "application/octet-stream")
+            final_name = original_name
 
-if __name__ == "__main__":
-  port = int(os.environ.get("PORT", 10000))
-  app.run(host="0.0.0.0", port=port)
+            # AI rename: PDFs only, and only for /fetch2
+            if rename and ext == ".pdf":
+                await ctx.send(f"Analyzing `{original_name}`...")
+                final_name = await loop.run_in_executor(
+                    None, analyze_pdf_with_llm, file_bytes, original_name
+                )
+                await ctx.send(f"Renamed → `{final_name}`")
+            else:
+                await ctx.send(f"Uploading `{original_name}`...")
 
+            result = await loop.run_in_executor(
+                None, upload_to_drive, final_name, file_bytes, mime_type
+            )
+
+            if result.get("status") == "success":
+                success += 1
+                await ctx.send(f"Uploaded {success}/{len(queue)}")
+            else:
+                await ctx.send(f"Upload failed: {result.get('message')}")
+
+            await asyncio.sleep(1.5)
+
+        except Exception as e:
+            await ctx.send(f"Error: {str(e)}")
+
+    await ctx.send(f"Done. {success}/{len(queue)} uploaded.")
+
+# ---------------- COMMANDS ----------------
+# /fetch  <channel_id> [count]  -> download + reupload as-is (PDFs and images)
+# /fetch2 <channel_id> [count]  -> same, but PDFs are renamed with Groq
+# count defaults to 1 (latest file). Use -1 for everything.
+@bot.command(name="fetch")
+async def fetch_plain(ctx, target_channel_id: int, doc_count: int = 1):
+    await run_fetch(ctx, target_channel_id, doc_count, rename=False)
+
+@bot.command(name="fetch2")
+async def fetch_renamed(ctx, target_channel_id: int, doc_count: int = 1):
+    await run_fetch(ctx, target_channel_id, doc_count, rename=True)
+
+# ---------------- START ----------------
+Thread(target=run_flask).start()
+bot.run(DISCORD_TOKEN)
