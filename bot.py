@@ -24,8 +24,6 @@ MIME_TYPES = {
     ".gif": "image/gif",
     ".webp": "image/webp",
 }
-HISTORY_SCAN_LIMIT = 500  # how many messages to look back when doc_count is set
-
 # ---------------- FLASK ----------------
 app = Flask('')
 
@@ -153,6 +151,55 @@ def upload_to_drive(file_name, file_bytes, mime_type):
     response = requests.post(GAS_WEBAPP_URL, json=payload, timeout=60)
     return response.json()
 
+# ---------------- OPTION PARSING ----------------
+# /fetch [ID] [option1] [option2]
+#   option1 positive N  -> download the latest N files, no skip
+#   option1 = "N"       -> download everything (until an error occurs)
+#   option1 negative -N -> skip the first N files found, then use option2:
+#       option2 positive M -> download M files after the skip
+#       option2 = "N"      -> download everything after the skip (until an error occurs)
+# Returns (skip: int, count: int|None). count=None means "unlimited, stop only on error".
+def parse_fetch_options(option1: str, option2: str):
+    o1 = option1.strip()
+
+    if o1.upper() == "N":
+        return 0, None
+
+    try:
+        v1 = int(o1)
+    except ValueError:
+        raise ValueError(f"`{option1}` isn't a valid number. Use a whole number, or `N`.")
+
+    if v1 == 0:
+        raise ValueError("The count can't be 0.")
+
+    if v1 > 0:
+        return 0, v1
+
+    # v1 is negative -> it's a skip count, option2 says how many to download after
+    skip = abs(v1)
+
+    if option2 is None:
+        raise ValueError(
+            f"You asked to skip {skip}, but didn't say how many to download after. "
+            f"Add a second number, e.g. `{option1} 5`, or `{option1} N` for everything."
+        )
+
+    o2 = option2.strip()
+
+    if o2.upper() == "N":
+        return skip, None
+
+    try:
+        v2 = int(o2)
+    except ValueError:
+        raise ValueError(f"`{option2}` isn't a valid number. Use a whole number, or `N`.")
+
+    if v2 <= 0:
+        raise ValueError("The second number (how many to download) must be positive, or `N`.")
+
+    return skip, v2
+
 # ---------------- CHAT FEATURE ----------------
 @bot.event
 async def on_message(message):
@@ -172,14 +219,18 @@ async def on_message(message):
     await bot.process_commands(message)
 
 # ---------------- CORE FETCH LOGIC ----------------
-async def run_fetch(ctx, target_channel_id: int, doc_count: int, rename: bool):
+async def run_fetch(ctx, target_channel_id: int, option1: str, option2: str, rename: bool):
     if not isinstance(ctx.channel, discord.DMChannel):
         await ctx.author.send("Error: Use this command in DM only.")
         return
 
-    if doc_count == 0 or doc_count < -1:
-        await ctx.send("Count must be a positive number, or -1 for everything.")
+    try:
+        skip, count = parse_fetch_options(option1, option2)
+    except ValueError as e:
+        await ctx.send(str(e))
         return
+
+    unlimited = count is None
 
     target_channel = bot.get_channel(target_channel_id)
     if not target_channel:
@@ -189,32 +240,44 @@ async def run_fetch(ctx, target_channel_id: int, doc_count: int, rename: bool):
             await ctx.send("Could not access channel.")
             return
 
-    fetch_all = doc_count == -1
-    scan_limit = None if fetch_all else HISTORY_SCAN_LIMIT
-
     await ctx.send(f"Scanning #{target_channel.name}...")
 
-    # History is newest -> oldest, so we collect the most recent files first
+    # History is newest -> oldest, so index 1 = most recent matching file.
+    # We scan the full history so skipping is always accurate; if a count is
+    # given we stop early once we've collected enough to cover skip+count.
+    target_needed = None if unlimited else skip + count
     queue = []
-    async for message in target_channel.history(limit=scan_limit):
+    async for message in target_channel.history(limit=None):
         for attachment in message.attachments:
             if is_supported(attachment):
                 queue.append(attachment)
-                if not fetch_all and len(queue) >= doc_count:
+                if target_needed is not None and len(queue) >= target_needed:
                     break
-        if not fetch_all and len(queue) >= doc_count:
-            break  # stop scanning entirely, not just the inner loop
+        if target_needed is not None and len(queue) >= target_needed:
+            break
+
+    total_found = len(queue)
+
+    if skip >= total_found:
+        await ctx.send(
+            f"Found {total_found} file(s), but that's not enough to skip {skip}. Nothing to download."
+        )
+        return
+
+    selected = queue[skip:] if unlimited else queue[skip:skip + count]
 
     # Upload oldest -> newest so Drive order matches channel order
-    queue.reverse()
+    selected.reverse()
 
     mode = "with AI rename" if rename else "no rename"
-    await ctx.send(f"Found {len(queue)} file(s) ({mode}). Processing...")
+    limit_desc = "until an error occurs" if unlimited else f"{len(selected)} file(s)"
+    await ctx.send(f"Skipping {skip}, downloading {limit_desc} ({mode}). Processing...")
 
     loop = asyncio.get_running_loop()
     success = 0
+    stopped_early = False
 
-    for attachment in queue:
+    for attachment in selected:
         try:
             file_bytes = await attachment.read()
             original_name = attachment.filename
@@ -238,29 +301,47 @@ async def run_fetch(ctx, target_channel_id: int, doc_count: int, rename: bool):
 
             if result.get("status") == "success":
                 success += 1
-                await ctx.send(f"Uploaded {success}/{len(queue)}")
+                await ctx.send(f"Uploaded {success}/{len(selected)}")
             else:
                 await ctx.send(f"Upload failed: {result.get('message')}")
+                if unlimited:
+                    stopped_early = True
+                    break
 
             await asyncio.sleep(1.5)
 
         except Exception as e:
             await ctx.send(f"Error: {str(e)}")
+            if unlimited:
+                stopped_early = True
+                break
 
-    await ctx.send(f"Done. {success}/{len(queue)} uploaded.")
+    last_index = skip + success  # resume point: use this as next skip value
+    summary = f"Done. Skipped {skip}, uploaded {success}."
+    if stopped_early:
+        summary += " Stopped early due to an error."
+    summary += f" Last uploaded file index: {last_index} — use `-{last_index}` as option1 next time to continue from here."
+    await ctx.send(summary)
 
 # ---------------- COMMANDS ----------------
-# /fetch  <channel_id> [count]  -> download + reupload as-is (PDFs and images)
-# /fetch2 <channel_id> [count]  -> same, but PDFs are renamed with Groq
-# count defaults to 1 (latest file). Use -1 for everything.
+# /fetch  <channel_id> [option1] [option2]  -> download + reupload as-is (PDFs and images)
+# /fetch2 <channel_id> [option1] [option2]  -> same, but PDFs are renamed with Groq
+#
+# option1 > 0        -> download the latest option1 files (no skip)
+# option1 = N         -> download everything, newest first, until an error occurs
+# option1 < 0         -> skip the first |option1| files found, then look at option2:
+#     option2 > 0       -> download that many files after the skip
+#     option2 = N       -> download everything after the skip, until an error occurs
+# Defaults to option1=1 (just the latest file) if nothing is given.
 @bot.command(name="fetch")
-async def fetch_plain(ctx, target_channel_id: int, doc_count: int = 1):
-    await run_fetch(ctx, target_channel_id, doc_count, rename=False)
+async def fetch_plain(ctx, target_channel_id: int, option1: str = "1", option2: str = None):
+    await run_fetch(ctx, target_channel_id, option1, option2, rename=False)
 
 @bot.command(name="fetch2")
-async def fetch_renamed(ctx, target_channel_id: int, doc_count: int = 1):
-    await run_fetch(ctx, target_channel_id, doc_count, rename=True)
+async def fetch_renamed(ctx, target_channel_id: int, option1: str = "1", option2: str = None):
+    await run_fetch(ctx, target_channel_id, option1, option2, rename=True)
 
 # ---------------- START ----------------
 Thread(target=run_flask).start()
 bot.run(DISCORD_TOKEN)
+
