@@ -2,11 +2,12 @@ import os
 import re
 import base64
 import asyncio
+import json
 import requests
 from flask import Flask
 from threading import Thread
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from pypdf import PdfReader
 import io
 
@@ -24,6 +25,20 @@ MIME_TYPES = {
     ".gif": "image/gif",
     ".webp": "image/webp",
 }
+
+# --- Sheet -> announcement feature (PFE project sheet) ---
+SHEET_WEBAPP_URL = os.getenv("SHEET_WEBAPP_URL")  # URL of the NEW, separate Apps Script deployment
+SHEET_ID = os.getenv("SHEET_ID", "1E6DVFetxlMStgiiCKFA5v8l8cW25_WoVJEYPgDph5WE")
+SHEET_NAME = os.getenv("SHEET_NAME", "Form Responses 1")
+ANNOUNCE_CHANNEL_ID = os.getenv("ANNOUNCE_CHANNEL_ID", "1399062753028608100")
+SHEET_POLL_SECONDS = int(os.getenv("SHEET_POLL_SECONDS", "60"))
+SHEET_STATE_FILE = "sheet_state.json"
+
+PFE_ANALYSIS_PROMPT = (
+    "these are the details of projet fin d'etude of a university professor "
+    "give details about the project, propose critical and essential questions "
+    "that must be asked to the professor about the project before proceeding to start"
+)
 # ---------------- FLASK ----------------
 app = Flask('')
 
@@ -43,6 +58,8 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 @bot.event
 async def on_ready():
     print(f"Bot successfully connected as {bot.user}")
+    if not check_sheet.is_running():
+        check_sheet.start()
 
 # ---------------- GROQ FUNCTION ----------------
 def ask_groq(prompt, model="openai/gpt-oss-120b"):
@@ -199,6 +216,129 @@ def parse_fetch_options(option1: str, option2: str):
         raise ValueError("The second number (how many to download) must be positive, or `N`.")
 
     return skip, v2
+
+# ---------------- SHEET -> ANNOUNCEMENT ----------------
+def load_sheet_state():
+    if os.path.exists(SHEET_STATE_FILE):
+        try:
+            with open(SHEET_STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"last_row_count": None}
+
+def save_sheet_state(state):
+    with open(SHEET_STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+def fetch_sheet_rows():
+    params = {"sheetId": SHEET_ID, "sheetName": SHEET_NAME}
+    r = requests.get(SHEET_WEBAPP_URL, params=params, timeout=30)
+    data = r.json()
+    if data.get("status") != "success":
+        raise Exception(data.get("message", "Unknown sheet error"))
+    return data["rows"]
+
+def build_project_prompt(row: dict) -> str:
+    def g(*keys):
+        for k in keys:
+            v = row.get(k)
+            if v and str(v).strip():
+                return str(v).strip()
+        return ""
+
+    supervisor = g("Nom et Prénom encadreur")
+    co_supervisor = g("Nom et Prénom Co-encadreur")
+    domain = g("Domaine")
+    title = g("Titre du sujet")
+    description = g("Description du sujet")
+    plan = g("Plan du travail")
+
+    details = f"Supervisor: {supervisor}\n"
+    if co_supervisor:
+        details += f"Co-supervisor: {co_supervisor}\n"
+    details += f"Domain: {domain}\nTitle: {title}\n"
+    if description:
+        details += f"Description: {description}\n"
+    if plan:
+        details += f"Work plan: {plan}\n"
+
+    return f"{PFE_ANALYSIS_PROMPT}\n\n{details}"
+
+async def send_long_message(channel, text, prefix=""):
+    if prefix:
+        text = f"{prefix}\n\n{text}"
+    chunk_size = 1900
+    for i in range(0, len(text), chunk_size):
+        await channel.send(text[i:i + chunk_size])
+
+@tasks.loop(seconds=SHEET_POLL_SECONDS)
+async def check_sheet():
+    if not (SHEET_ID and ANNOUNCE_CHANNEL_ID and SHEET_WEBAPP_URL):
+        return  # feature not configured, skip silently
+
+    loop = asyncio.get_running_loop()
+    try:
+        rows = await loop.run_in_executor(None, fetch_sheet_rows)
+    except Exception as e:
+        print("Sheet check failed:", e)
+        return
+
+    state = load_sheet_state()
+    last_count = state.get("last_row_count")
+
+    if last_count is None:
+        # First run ever: set the baseline without announcing existing rows.
+        state["last_row_count"] = len(rows)
+        save_sheet_state(state)
+        print(f"Sheet baseline set at {len(rows)} row(s). Future additions will be announced.")
+        return
+
+    if len(rows) > last_count:
+        new_rows = rows[last_count:]
+        channel = bot.get_channel(int(ANNOUNCE_CHANNEL_ID))
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(int(ANNOUNCE_CHANNEL_ID))
+            except Exception as e:
+                print("Could not reach announce channel:", e)
+                return
+
+        for row in new_rows:
+            title = row.get("Titre du sujet") or "Untitled project"
+            try:
+                prompt = build_project_prompt(row)
+                analysis = await loop.run_in_executor(None, ask_groq, prompt)
+            except Exception as e:
+                analysis = f"(AI analysis failed: {e})"
+
+            header = f"📢 **New PFE project posted:** {title}"
+            try:
+                await send_long_message(channel, analysis, prefix=header)
+            except Exception as e:
+                print("Failed to send announcement:", e)
+
+        state["last_row_count"] = len(rows)
+        save_sheet_state(state)
+
+    elif len(rows) < last_count:
+        # Rows were deleted/cleared — reset baseline so we don't misfire later.
+        state["last_row_count"] = len(rows)
+        save_sheet_state(state)
+
+@check_sheet.before_loop
+async def before_check_sheet():
+    await bot.wait_until_ready()
+
+# Manual trigger for testing, usable anywhere (not DM-restricted like /fetch)
+@bot.command(name="checksheet")
+async def checksheet_command(ctx):
+    if not (SHEET_ID and ANNOUNCE_CHANNEL_ID and SHEET_WEBAPP_URL):
+        await ctx.send("Sheet announcements aren't configured (missing SHEET_WEBAPP_URL / SHEET_ID / ANNOUNCE_CHANNEL_ID).")
+        return
+    await ctx.send("Checking sheet now...")
+    await check_sheet()
+    await ctx.send("Check complete.")
 
 # ---------------- CHAT FEATURE ----------------
 @bot.event
