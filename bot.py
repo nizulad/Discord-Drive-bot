@@ -45,7 +45,7 @@ async def on_ready():
     print(f"Bot successfully connected as {bot.user}")
 
 # ---------------- GROQ FUNCTION ----------------
-def ask_groq(prompt, model="llama-3.3-70b-versatile"):
+def ask_groq(prompt, model="openai/gpt-oss-120b"):
     url = "https://api.groq.com/openai/v1/chat/completions"
 
     headers = {
