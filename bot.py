@@ -28,7 +28,7 @@ MIME_TYPES = {
 
 # --- Sheet -> announcement feature (PFE project sheet) ---
 SHEET_WEBAPP_URL = os.getenv("SHEET_WEBAPP_URL")  # URL of the NEW, separate Apps Script deployment
-SHEET_ID = os.getenv("SHEET_ID", "1g0i0iSrhLLHahzpTa_AYTuVhHv4sRtFoMCt3HdJJ5uA")
+SHEET_ID = os.getenv("SHEET_ID", "1E6DVFetxlMStgiiCKFA5v8l8cW25_WoVJEYPgDph5WE")
 SHEET_NAME = os.getenv("SHEET_NAME", "Form Responses 1")
 ANNOUNCE_CHANNEL_ID = os.getenv("ANNOUNCE_CHANNEL_ID", "1399062753028608100")
 SHEET_POLL_SECONDS = int(os.getenv("SHEET_POLL_SECONDS", "60"))
@@ -273,25 +273,34 @@ async def send_long_message(channel, text, prefix=""):
         await channel.send(text[i:i + chunk_size])
 
 @tasks.loop(seconds=SHEET_POLL_SECONDS)
-async def check_sheet():
+async def check_sheet(report_ctx=None):
     if not (SHEET_ID and ANNOUNCE_CHANNEL_ID and SHEET_WEBAPP_URL):
-        return  # feature not configured, skip silently
+        if report_ctx:
+            await report_ctx.send("Sheet feature isn't fully configured (check SHEET_WEBAPP_URL / SHEET_ID / ANNOUNCE_CHANNEL_ID).")
+        return  # feature not configured, skip silently otherwise
 
     loop = asyncio.get_running_loop()
     try:
         rows = await loop.run_in_executor(None, fetch_sheet_rows)
     except Exception as e:
         print("Sheet check failed:", e)
+        if report_ctx:
+            await report_ctx.send(f"Sheet check failed: {e}")
         return
 
     state = load_sheet_state()
     last_count = state.get("last_row_count")
+
+    if report_ctx:
+        await report_ctx.send(f"Sheet has {len(rows)} row(s) right now; last saved count was {last_count}.")
 
     if last_count is None:
         # First run ever: set the baseline without announcing existing rows.
         state["last_row_count"] = len(rows)
         save_sheet_state(state)
         print(f"Sheet baseline set at {len(rows)} row(s). Future additions will be announced.")
+        if report_ctx:
+            await report_ctx.send(f"No baseline existed — set it at {len(rows)} row(s). Nothing announced yet; only rows added from now on will be.")
         return
 
     if len(rows) > last_count:
@@ -302,6 +311,8 @@ async def check_sheet():
                 channel = await bot.fetch_channel(int(ANNOUNCE_CHANNEL_ID))
             except Exception as e:
                 print("Could not reach announce channel:", e)
+                if report_ctx:
+                    await report_ctx.send(f"Found {len(new_rows)} new row(s) but couldn't reach the announce channel: {e}")
                 return
 
         for row in new_rows:
@@ -317,28 +328,44 @@ async def check_sheet():
                 await send_long_message(channel, analysis, prefix=header)
             except Exception as e:
                 print("Failed to send announcement:", e)
+                if report_ctx:
+                    await report_ctx.send(f"Failed to post announcement for '{title}': {e}")
 
         state["last_row_count"] = len(rows)
         save_sheet_state(state)
+        if report_ctx:
+            await report_ctx.send(f"Announced {len(new_rows)} new row(s).")
 
     elif len(rows) < last_count:
         # Rows were deleted/cleared — reset baseline so we don't misfire later.
         state["last_row_count"] = len(rows)
         save_sheet_state(state)
+        if report_ctx:
+            await report_ctx.send(f"Row count dropped ({last_count} → {len(rows)}) — reset baseline, nothing announced.")
+    else:
+        if report_ctx:
+            await report_ctx.send("No new rows since last check.")
 
 @check_sheet.before_loop
 async def before_check_sheet():
     await bot.wait_until_ready()
 
 # Manual trigger for testing, usable anywhere (not DM-restricted like /fetch)
+# Reports what it finds back to Discord instead of only logging to the console.
 @bot.command(name="checksheet")
 async def checksheet_command(ctx):
-    if not (SHEET_ID and ANNOUNCE_CHANNEL_ID and SHEET_WEBAPP_URL):
-        await ctx.send("Sheet announcements aren't configured (missing SHEET_WEBAPP_URL / SHEET_ID / ANNOUNCE_CHANNEL_ID).")
-        return
-    await ctx.send("Checking sheet now...")
-    await check_sheet()
-    await ctx.send("Check complete.")
+    await check_sheet(ctx)
+
+# Clears the saved row-count baseline — use this after pointing the bot at a
+# different spreadsheet, so it doesn't compare the new sheet's row count
+# against the old sheet's leftover count.
+@bot.command(name="resetsheetstate")
+async def reset_sheet_state_command(ctx):
+    if os.path.exists(SHEET_STATE_FILE):
+        os.remove(SHEET_STATE_FILE)
+        await ctx.send("Sheet state cleared. The next check sets a fresh baseline (existing rows won't be announced).")
+    else:
+        await ctx.send("No saved state found — already clean.")
 
 # ---------------- CHAT FEATURE ----------------
 @bot.event
