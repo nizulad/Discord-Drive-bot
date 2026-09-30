@@ -27,18 +27,12 @@ MIME_TYPES = {
 }
 
 # --- Sheet -> announcement feature (PFE project sheet) ---
-SHEET_WEBAPP_URL = os.getenv("SHEET_WEBAPP_URL")  # URL of the NEW, separate Apps Script deployment
+SHEET_WEBAPP_URL = os.getenv("SHEET_WEBAPP_URL")  # URL of the separate Apps Script deployment
 SHEET_ID = os.getenv("SHEET_ID", "1E6DVFetxlMStgiiCKFA5v8l8cW25_WoVJEYPgDph5WE")
-SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1")
-ANNOUNCE_CHANNEL_ID = os.getenv("ANNOUNCE_CHANNEL_ID", "1399062753028608100")
+SHEET_NAME = os.getenv("SHEET_NAME", "Form Responses 1")
+ANNOUNCE_CHANNEL_ID = os.getenv("ANNOUNCE_CHANNEL_ID", "1554917714374557826")
 SHEET_POLL_SECONDS = int(os.getenv("SHEET_POLL_SECONDS", "60"))
 SHEET_STATE_FILE = "sheet_state.json"
-
-PFE_ANALYSIS_PROMPT = (
-    "these are the details of projet fin d'etude of a university professor "
-    "give details about the project, propose critical and essential questions "
-    "that must be asked to the professor about the project before proceeding to start"
-)
 
 SHEET_DEBUG = os.getenv("SHEET_DEBUG", "false").strip().lower() == "true"
 # ---------------- FLASK ----------------
@@ -243,39 +237,6 @@ def fetch_sheet_rows():
         raise Exception(data.get("message", "Unknown sheet error"))
     return data["rows"]
 
-def build_project_prompt(row: dict) -> str:
-    def g(*keys):
-        for k in keys:
-            v = row.get(k)
-            if v and str(v).strip():
-                return str(v).strip()
-        return ""
-
-    supervisor = g("Nom et Prénom encadreur")
-    co_supervisor = g("Nom et Prénom Co-encadreur")
-    domain = g("Domaine")
-    title = g("Titre du sujet")
-    description = g("Description du sujet")
-    plan = g("Plan du travail")
-
-    details = f"Supervisor: {supervisor}\n"
-    if co_supervisor:
-        details += f"Co-supervisor: {co_supervisor}\n"
-    details += f"Domain: {domain}\nTitle: {title}\n"
-    if description:
-        details += f"Description: {description}\n"
-    if plan:
-        details += f"Work plan: {plan}\n"
-
-    return f"{PFE_ANALYSIS_PROMPT}\n\n{details}"
-
-async def send_long_message(channel, text, prefix=""):
-    if prefix:
-        text = f"{prefix}\n\n{text}"
-    chunk_size = 1900
-    for i in range(0, len(text), chunk_size):
-        await channel.send(text[i:i + chunk_size])
-
 @tasks.loop(seconds=SHEET_POLL_SECONDS)
 async def check_sheet(report_ctx=None):
     if not (SHEET_ID and ANNOUNCE_CHANNEL_ID and SHEET_WEBAPP_URL):
@@ -320,20 +281,15 @@ async def check_sheet(report_ctx=None):
                 return
 
         for row in new_rows:
-            title = row.get("Titre du sujet") or "Untitled project"
             try:
-                prompt = build_project_prompt(row)
-                analysis = await loop.run_in_executor(None, ask_groq, prompt)
-            except Exception as e:
-                analysis = f"(AI analysis failed: {e})"
-
-            header = f"📢 **New PFE project posted:** {title}"
-            try:
-                await send_long_message(channel, analysis, prefix=header)
+                await channel.send(
+                    "@everyone a new theme has been announced",
+                    allowed_mentions=discord.AllowedMentions(everyone=True),
+                )
             except Exception as e:
                 print("Failed to send announcement:", e)
                 if report_ctx:
-                    await report_ctx.send(f"Failed to post announcement for '{title}': {e}")
+                    await report_ctx.send(f"Failed to post announcement: {e}")
 
         state["last_row_count"] = len(rows)
         save_sheet_state(state)
