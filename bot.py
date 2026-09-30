@@ -39,6 +39,8 @@ PFE_ANALYSIS_PROMPT = (
     "give details about the project, propose critical and essential questions "
     "that must be asked to the professor about the project before proceeding to start"
 )
+
+SHEET_DEBUG = os.getenv("SHEET_DEBUG", "false").strip().lower() == "true"
 # ---------------- FLASK ----------------
 app = Flask('')
 
@@ -60,6 +62,8 @@ async def on_ready():
     print(f"Bot successfully connected as {bot.user}")
     if not check_sheet.is_running():
         check_sheet.start()
+    if SHEET_DEBUG and not debug_sheet_read.is_running():
+        debug_sheet_read.start()
 
 # ---------------- GROQ FUNCTION ----------------
 def ask_groq(prompt, model="openai/gpt-oss-120b"):
@@ -348,6 +352,43 @@ async def check_sheet(report_ctx=None):
 
 @check_sheet.before_loop
 async def before_check_sheet():
+    await bot.wait_until_ready()
+
+# ---------------- TEMPORARY DEBUG: prove the bot can see the sheet ----------------
+# Enable with env var SHEET_DEBUG=true. Posts a raw read of the sheet every
+# 30s to the announce channel, independent of the real announcement logic —
+# just to confirm connectivity/permissions/column names. Turn it back off
+# (unset SHEET_DEBUG) once confirmed, or it'll post every 30s forever.
+@tasks.loop(seconds=30)
+async def debug_sheet_read():
+    if not (SHEET_ID and SHEET_WEBAPP_URL and ANNOUNCE_CHANNEL_ID):
+        return
+
+    loop = asyncio.get_running_loop()
+    try:
+        rows = await loop.run_in_executor(None, fetch_sheet_rows)
+    except Exception as e:
+        msg = f"🔧 Debug: sheet read FAILED — {e}"
+    else:
+        if rows:
+            last_row = rows[-1]
+            preview = ", ".join(f"{k}: {str(v)[:40]}" for k, v in last_row.items())
+            msg = f"🔧 Debug: read OK, {len(rows)} row(s) found. Last row → {preview}"
+        else:
+            msg = "🔧 Debug: read OK, but 0 rows found (check the tab name / sheet is right)."
+
+    channel = bot.get_channel(int(ANNOUNCE_CHANNEL_ID))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(ANNOUNCE_CHANNEL_ID))
+        except Exception as e:
+            print("Debug loop couldn't reach channel:", e)
+            return
+
+    await channel.send(msg[:1900])
+
+@debug_sheet_read.before_loop
+async def before_debug_sheet_read():
     await bot.wait_until_ready()
 
 # Manual trigger for testing, usable anywhere (not DM-restricted like /fetch)
