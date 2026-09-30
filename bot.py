@@ -28,7 +28,7 @@ MIME_TYPES = {
 
 # --- Sheet -> announcement feature (PFE project sheet) ---
 SHEET_WEBAPP_URL = os.getenv("SHEET_WEBAPP_URL")  # URL of the NEW, separate Apps Script deployment
-SHEET_ID = os.getenv("SHEET_ID", "1E6DVFetxlMStgiiCKFA5v8l8cW25_WoVJEYPgDph5WE")
+SHEET_ID = os.getenv("SHEET_ID", "1g0i0iSrhLLHahzpTa_AYTuVhHv4sRtFoMCt3HdJJ5uA")
 SHEET_NAME = os.getenv("SHEET_NAME", "Form Responses 1")
 ANNOUNCE_CHANNEL_ID = os.getenv("ANNOUNCE_CHANNEL_ID", "1399062753028608100")
 SHEET_POLL_SECONDS = int(os.getenv("SHEET_POLL_SECONDS", "60"))
